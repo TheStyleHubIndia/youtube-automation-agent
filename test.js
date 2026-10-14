@@ -44,6 +44,7 @@ class SystemTest {
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
       { name: 'AI Provider Failover', test: () => this.testAITextProviderFailover() },
       { name: 'Concurrent Schedule Deduplication', test: () => this.testConcurrentScheduleDeduplication() },
+      { name: 'YouTube Scheduled Publish Metadata', test: () => this.testYouTubePublishAtMetadata() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
@@ -2374,6 +2375,51 @@ class SystemTest {
     if (rows.length !== 1) throw new Error(`Expected one schedule row, got ${rows.length}`);
     if (new Set(saved.map(entry => entry.id)).size !== 1) {
       throw new Error('Concurrent schedule requests returned different schedule IDs');
+    }
+  }
+
+  async testYouTubePublishAtMetadata() {
+    const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
+    const agent = new PublishingSchedulingAgent({
+      updateScheduleEntry: async () => {}
+    }, {});
+    let requestBody = null;
+    agent.youtube = {
+      videos: {
+        insert: async request => {
+          requestBody = request.requestBody;
+          return { data: { id: 'test-youtube-id' } };
+        }
+      }
+    };
+    agent.getVideoStream = async () => ({});
+
+    const baseEntry = {
+      productionId: 'publish-at-test',
+      metadata: {
+        seo: {
+          title: 'Valid test title',
+          description: 'A sufficiently detailed description for validating YouTube scheduled publishing metadata.',
+          tags: ['test tag one', 'test tag two', 'test tag three'],
+          categoryId: '22',
+          defaultLanguage: 'en',
+          defaultAudioLanguage: 'en'
+        },
+        video: { path: 'test.mp4' },
+        privacyStatus: 'private'
+      }
+    };
+
+    const futureTime = new Date(Date.now() + 10 * 60_000).toISOString();
+    await agent.uploadToYouTube({ ...baseEntry, publishTime: futureTime, metadata: { ...baseEntry.metadata, seo: { ...baseEntry.metadata.seo }, video: { ...baseEntry.metadata.video } } });
+    if (requestBody.status.privacyStatus !== 'private' || requestBody.status.publishAt !== futureTime) {
+      throw new Error('A future scheduled upload must use private status and publishAt');
+    }
+
+    const pastTime = new Date(Date.now() - 10 * 60_000).toISOString();
+    await agent.uploadToYouTube({ ...baseEntry, publishTime: pastTime, metadata: { ...baseEntry.metadata, seo: { ...baseEntry.metadata.seo }, video: { ...baseEntry.metadata.video } } });
+    if (requestBody.status.privacyStatus !== 'private' || requestBody.status.publishAt !== pastTime) {
+      throw new Error('An overdue scheduled upload must retain publishAt so YouTube publishes it immediately');
     }
   }
 
