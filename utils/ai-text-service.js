@@ -57,108 +57,128 @@ class AITextService {
     this._init(credentials);
   }
 
-  _init(credentials) {
-    const provider = credentials.aiProvider?.provider;
-    const apiKey = credentials.aiProvider?.apiKey;
-    const model = credentials.aiProvider?.model;
-
-    if (provider && PROVIDERS[provider] && apiKey) {
-      return this._initOpenAICompatible(PROVIDERS[provider], apiKey, model);
-    }
-
-    for (const [, preset] of Object.entries(PROVIDERS)) {
-      const key = process.env[preset.envKey];
-      if (key) {
-        return this._initOpenAICompatible(preset, key);
+  _init(credentials = {}) {
+    this.fallbackProviders = [];
+    const candidates = [];
+    const addOpenAICompatible = (preset, apiKey, model) => {
+      if (!preset || !apiKey) return;
+      const identity = `${preset.name}:${apiKey}`;
+      if (candidates.some(item => item.identity === identity)) return;
+      candidates.push({
+        identity,
+        type: 'openai-compatible',
+        name: preset.name,
+        client: new OpenAI({ apiKey, baseURL: preset.baseURL }),
+        model: model || preset.defaultModel
+      });
+    };
+    const addGemini = (apiKey, model) => {
+      if (!apiKey) return;
+      const identity = `Google Gemini:${apiKey}`;
+      if (candidates.some(item => item.identity === identity)) return;
+      try {
+        const { GoogleGenAI } = require('@google/genai');
+        candidates.push({
+          identity,
+          type: 'gemini',
+          name: 'Google Gemini',
+          client: new GoogleGenAI({ apiKey }),
+          model: model || GEMINI_DEFAULT_MODEL
+        });
+      } catch (error) {
+        this.logger.error('Failed to initialize Gemini:', error.message);
       }
+    };
+
+    // Explicit provider selection is primary; other configured providers are failover-only.
+    const selected = credentials.aiProvider;
+    if (selected?.provider && PROVIDERS[selected.provider] && selected.apiKey) {
+      addOpenAICompatible(PROVIDERS[selected.provider], selected.apiKey, selected.model);
+    } else if (credentials.openai?.apiKey) {
+      addOpenAICompatible(PROVIDERS.openai, credentials.openai.apiKey, credentials.openai.model);
     }
 
-    const geminiKey = credentials.gemini?.apiKey || process.env.GEMINI_API_KEY;
-    if (geminiKey) {
-      return this._initGemini(geminiKey, credentials.gemini?.model);
+    for (const preset of Object.values(PROVIDERS)) {
+      addOpenAICompatible(preset, process.env[preset.envKey],
+        preset === PROVIDERS.openai ? credentials.openai?.model : undefined);
+    }
+    addOpenAICompatible(PROVIDERS.openai, credentials.openai?.apiKey, credentials.openai?.model);
+    addGemini(credentials.gemini?.apiKey || process.env.GEMINI_API_KEY, credentials.gemini?.model);
+
+    const primary = candidates.shift();
+    if (!primary) {
+      this.logger.warn('No AI text provider configured — text generation unavailable');
+      return;
     }
 
-    this.logger.warn('No AI text provider configured — text generation unavailable');
+    this.primaryProvider = primary;
+    this.fallbackProviders = candidates;
+    this.client = primary.type === 'openai-compatible' ? primary.client : null;
+    this.gemini = primary.type === 'gemini' ? primary.client : null;
+    this.model = primary.model;
+    this.providerName = primary.name;
+    this.logger.info(`${primary.name} initialized (model: ${this.model}); ${candidates.length} fallback provider(s) available`);
   }
 
-  _initOpenAICompatible(preset, apiKey, model) {
-    this.client = new OpenAI({ apiKey, baseURL: preset.baseURL });
-    this.model = model || preset.defaultModel;
-    this.providerName = preset.name;
-    this.logger.info(`${preset.name} initialized (model: ${this.model})`);
-  }
-
-  _initGemini(apiKey, model) {
-    try {
-      const { GoogleGenAI } = require('@google/genai');
-      this.gemini = new GoogleGenAI({ apiKey });
-      this.model = model || GEMINI_DEFAULT_MODEL;
-      this.providerName = 'Google Gemini';
-      this.logger.info(`Gemini initialized (model: ${this.model})`);
-    } catch (error) {
-      this.logger.error('Failed to initialize Gemini:', error.message);
-    }
-  }
-
-  async generateText(prompt, options = {}) {
-    const model = options.model || this.model;
+  async _generateFromProvider(provider, prompt, options = {}) {
+    const model = options.model || provider.model;
     const maxTokens = options.maxTokens || 2048;
     const temperature = options.temperature ?? 0.7;
 
-    if (this.gemini) {
+    if (provider.type === 'gemini') {
       const config = { maxOutputTokens: maxTokens };
-      if (!/^gemini-3\.(?:[5-9]|\d{2,})-/.test(model)) config.temperature = temperature;
-      const response = await this.gemini.models.generateContent({
-        model,
-        contents: prompt,
-        config,
-      });
+      if (!/^gemini-3\\.(?:[5-9]|\\d{2,})-/.test(model)) config.temperature = temperature;
+      const response = await provider.client.models.generateContent({ model, contents: prompt, config });
       const text = response && response.text;
       if (typeof text !== 'string' || !text.trim()) {
-        throw new Error(
-          `${this.providerName} returned an empty response. Check the API key and model quota — free-tier Gemini keys are rate-limited and can return empty output.`
-        );
+        throw new Error(`${provider.name} returned an empty response. Check the API key and model quota.`);
       }
       return text;
     }
 
-    if (!this.client) {
-      throw new Error('No AI text provider configured');
-    }
-
-    const params = {
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature,
-    };
-
+    const params = { model, messages: [{ role: 'user', content: prompt }], temperature };
     try {
-      // Newer OpenAI models (gpt-5.x and later) reject the legacy max_tokens
-      // parameter with a 400 error and require max_completion_tokens instead.
-      const response = await this.client.chat.completions.create({
+      const response = await provider.client.chat.completions.create({
         ...params,
-        max_completion_tokens: maxTokens,
+        max_completion_tokens: maxTokens
       });
-      return this._extractContent(response);
+      return this._extractContent(response, provider.name);
     } catch (error) {
-      // Older models and some providers reject max_completion_tokens with a 400;
-      // retry the same request using the legacy max_tokens spelling.
-      if (
-        error &&
-        error.status === 400 &&
-        /max(_completion)?_tokens/i.test(error.message || '')
-      ) {
-        const response = await this.client.chat.completions.create({
-          ...params,
-          max_tokens: maxTokens,
-        });
-        return this._extractContent(response);
+      if (error && error.status === 400 && /max(_completion)?_tokens/i.test(error.message || '')) {
+        const response = await provider.client.chat.completions.create({ ...params, max_tokens: maxTokens });
+        return this._extractContent(response, provider.name);
       }
       throw error;
     }
   }
 
-  _extractContent(response) {
+  async generateText(prompt, options = {}) {
+    // Preserve direct property overrides used by tests and callers that inject a client.
+    const primary = this.gemini
+      ? { type: 'gemini', name: this.providerName || 'Google Gemini', client: this.gemini, model: this.model }
+      : this.client
+        ? { type: 'openai-compatible', name: this.providerName || 'OpenAI', client: this.client, model: this.model }
+        : null;
+
+    if (!primary) throw new Error('No AI text provider configured');
+    try {
+      return await this._generateFromProvider(primary, prompt, options);
+    } catch (primaryError) {
+      for (const fallback of this.fallbackProviders || []) {
+        try {
+          this.logger.warn(`${primary.name} text generation failed; trying ${fallback.name} fallback: ${primaryError.message}`);
+          const result = await this._generateFromProvider(fallback, prompt, options);
+          this.logger.info(`AI text generation recovered using ${fallback.name}`);
+          return result;
+        } catch (fallbackError) {
+          this.logger.warn(`${fallback.name} fallback failed: ${fallbackError.message}`);
+        }
+      }
+      throw primaryError;
+    }
+  }
+
+  _extractContent(response, providerName = this.providerName) {
     const content =
       response &&
       response.choices &&
@@ -171,7 +191,7 @@ class AITextService {
       // A null/empty body used to surface as cryptic "Unexpected end of JSON input"
       // in the agents' JSON parsers. Report the real cause instead.
       throw new Error(
-        `${this.providerName} returned an empty response. Check the API key and model quota.`
+        `${providerName} returned an empty response. Check the API key and model quota.`
       );
     }
     return content;
