@@ -8,6 +8,7 @@ class Database {
     this.dbPath = path.join(__dirname, '..', 'data', 'youtube_automation.db');
     this.db = null;
     this.logger = new Logger('Database');
+    this.scheduleSaveChain = Promise.resolve();
   }
 
   async initialize() {
@@ -1765,28 +1766,37 @@ class Database {
 
   // Publishing methods
   async saveScheduleEntry(entry) {
-    const existing = await this.getLatestScheduleEntry(entry.productionId);
-    if (existing) return existing;
-    const id = this.generateId('schedule');
-    entry.id = id;
-    
-    await this.executeQuery(
-      `INSERT INTO publish_schedule (
-        id, production_id, title, publish_time, status, 
-        priority, metadata
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        entry.productionId,
-        entry.title,
-        entry.publishTime,
-        entry.status,
-        entry.priority,
-        JSON.stringify(entry.metadata)
-      ]
-    );
-    
-    return entry;
+    // Serialize the read-before-insert sequence so concurrent jobs in this process
+    // cannot both observe an empty schedule and create duplicate entries.
+    const save = async () => {
+      const existing = await this.getLatestScheduleEntry(entry.productionId);
+      if (existing) return existing;
+      const id = this.generateId('schedule');
+      const record = { ...entry, id };
+
+      await this.executeQuery(
+        `INSERT INTO publish_schedule (
+          id, production_id, title, publish_time, status,
+          priority, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          record.productionId,
+          record.title,
+          record.publishTime,
+          record.status,
+          record.priority,
+          JSON.stringify(record.metadata)
+        ]
+      );
+
+      Object.assign(entry, record);
+      return entry;
+    };
+
+    const pending = this.scheduleSaveChain.then(save, save);
+    this.scheduleSaveChain = pending.then(() => undefined, () => undefined);
+    return pending;
   }
 
   async updateScheduleEntry(entry) {
