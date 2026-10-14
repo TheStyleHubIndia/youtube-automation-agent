@@ -167,7 +167,7 @@ class AITextService {
       for (const fallback of this.fallbackProviders || []) {
         try {
           this.logger.warn(`${primary.name} text generation failed; trying ${fallback.name} fallback: ${primaryError.message}`);
-          const result = await this._generateFromProvider(fallback, prompt, options);
+          const result = await this._generateFromProvider(fallback, prompt, { ...options, model: undefined });
           this.logger.info(`AI text generation recovered using ${fallback.name}`);
           return result;
         } catch (fallbackError) {
