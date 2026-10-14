@@ -655,12 +655,12 @@ class Database {
       UPDATE publish_schedule
       SET status = 'duplicate_superseded',
           error_message = COALESCE(error_message, 'Superseded duplicate active schedule during deduplication')
-      WHERE status IN ('scheduled', 'paused', 'uploading')
+      WHERE status IN ('scheduled', 'paused')
         AND youtube_id IS NULL
         AND EXISTS (
           SELECT 1 FROM publish_schedule newer
           WHERE newer.production_id = publish_schedule.production_id
-            AND newer.status IN ('scheduled', 'paused', 'uploading')
+            AND newer.status IN ('scheduled', 'paused')
             AND (
               newer.created_at > publish_schedule.created_at OR
               (newer.created_at = publish_schedule.created_at AND newer.id > publish_schedule.id)
