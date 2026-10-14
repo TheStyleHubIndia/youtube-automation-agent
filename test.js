@@ -42,6 +42,8 @@ class SystemTest {
       { name: 'Publishing Safety', test: () => this.testPublishingSafety() },
       { name: 'Multi-Provider Credential Validation', test: () => this.testCredentialValidation() },
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
+      { name: 'AI Provider Failover', test: () => this.testAITextProviderFailover() },
+      { name: 'Concurrent Schedule Deduplication', test: () => this.testConcurrentScheduleDeduplication() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
@@ -2306,6 +2308,73 @@ class SystemTest {
     }
 
     this.logger.info('AI text service token parameter test completed successfully');
+  }
+
+  async testAITextProviderFailover() {
+    const { AITextService, PROVIDERS } = require('./utils/ai-text-service');
+    const keys = [...Object.values(PROVIDERS).map(provider => provider.envKey), 'GEMINI_API_KEY'];
+    const saved = {};
+    for (const key of keys) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    try {
+      const service = new AITextService({
+        aiProvider: { provider: 'openai', apiKey: 'test-openai-key', model: 'test-openai-model' },
+        gemini: { apiKey: 'test-gemini-key', model: 'test-gemini-model' }
+      });
+      service.client.chat.completions.create = async () => {
+        throw new Error('simulated OpenAI outage');
+      };
+      const fallback = service.fallbackProviders.find(provider => provider.type === 'gemini');
+      if (!fallback) throw new Error('Configured Gemini provider was not registered as fallback');
+      fallback.client.models.generateContent = async () => ({ text: 'gemini-fallback-ok' });
+
+      const result = await service.generateText('fallback test');
+      if (result !== 'gemini-fallback-ok') throw new Error('Gemini fallback did not recover text generation');
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
+  }
+
+  async testConcurrentScheduleDeduplication() {
+    const { Database } = require('./database/db');
+    const database = Object.create(Database.prototype);
+    database.scheduleSaveChain = Promise.resolve();
+    const rows = [];
+    let nextId = 0;
+    database.generateId = () => `schedule-test-${++nextId}`;
+    database.getLatestScheduleEntry = async productionId =>
+      rows.find(row => row.production_id === productionId) || null;
+    database.executeQuery = async (_sql, params) => {
+      rows.push({
+        id: params[0],
+        production_id: params[1],
+        title: params[2],
+        publish_time: params[3],
+        status: params[4],
+        priority: params[5],
+        metadata: params[6]
+      });
+    };
+
+    const attempts = Array.from({ length: 12 }, (_, index) => database.saveScheduleEntry({
+      productionId: 'same-production',
+      title: `Title ${index}`,
+      publishTime: new Date(Date.now() + 60_000).toISOString(),
+      status: 'scheduled',
+      priority: 50,
+      metadata: {}
+    }));
+    const saved = await Promise.all(attempts);
+    if (rows.length !== 1) throw new Error(`Expected one schedule row, got ${rows.length}`);
+    if (new Set(saved.map(entry => entry.id)).size !== 1) {
+      throw new Error('Concurrent schedule requests returned different schedule IDs');
+    }
   }
 
   async testPlaceholderSchedulingGuard() {
