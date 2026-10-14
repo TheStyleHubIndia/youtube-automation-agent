@@ -416,7 +416,7 @@ class YouTubeAutomationAgent {
     // Mutating/read-data operations in this schema require the configured x-api-key.
     this.app.get('/api/chatgpt/openapi.json', (req, res) => {
       const forwardedProto = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
-      const baseUrl = String(process.env.PUBLIC_BASE_URL || `${forwardedProto || req.protocol}://${req.get('host')}`).replace(/\\/$/, '');
+      const baseUrl = String(process.env.PUBLIC_BASE_URL || `${forwardedProto || req.protocol}://${req.get('host')}`).replace(/\/$/, '');
       res.json({
         openapi: '3.1.0',
         info: {
