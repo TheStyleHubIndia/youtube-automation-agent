@@ -222,14 +222,13 @@ class PublishingSchedulingAgent {
     
     // Prepare video metadata
     const requestedPublishTime = scheduleEntry.publishTime ? new Date(scheduleEntry.publishTime) : null;
-    const hasFuturePublishTime = Boolean(
-      requestedPublishTime &&
-      Number.isFinite(requestedPublishTime.getTime()) &&
-      requestedPublishTime.getTime() > Date.now() + 60_000
+    const hasValidPublishTime = Boolean(
+      requestedPublishTime && Number.isFinite(requestedPublishTime.getTime())
     );
-    // YouTube only accepts publishAt for a private video that has never been published.
-    // A past or malformed time must not accidentally publish a video immediately.
-    const privacyStatus = hasFuturePublishTime
+    // The queue uploads an item when its requested time is due. YouTube accepts
+    // publishAt only for private videos that have never been published; a past
+    // publishAt means publish immediately, which handles delayed queue processing.
+    const privacyStatus = hasValidPublishTime
       ? 'private'
       : (metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private');
     const videoStatus = {
@@ -237,7 +236,7 @@ class PublishingSchedulingAgent {
       selfDeclaredMadeForKids: false,
       containsSyntheticMedia: metadata.containsSyntheticMedia === true
     };
-    if (hasFuturePublishTime) videoStatus.publishAt = requestedPublishTime.toISOString();
+    if (hasValidPublishTime) videoStatus.publishAt = requestedPublishTime.toISOString();
 
     const videoMetadata = {
       snippet: {
