@@ -59,10 +59,13 @@ class SEOOptimizerAgent {
         .join(' ');
       if (hashtagLine) {
         const existingDescription = String(description || '').trim();
-        const descriptionWithHashtags = existingDescription.toLowerCase().includes(hashtagLine.toLowerCase())
-          ? existingDescription
-          : [existingDescription, hashtagLine].filter(Boolean).join('\n\n');
-        description = descriptionWithHashtags.slice(0, 5000);
+        if (existingDescription.toLowerCase().includes(hashtagLine.toLowerCase())) {
+          description = existingDescription.slice(0, 5000);
+        } else {
+          const descriptionBudget = Math.max(0, 5000 - hashtagLine.length - 2);
+          const clippedDescription = existingDescription.slice(0, descriptionBudget).trimEnd();
+          description = [clippedDescription, hashtagLine].filter(Boolean).join('\n\n').slice(0, 5000);
+        }
       }
 
       // Create chapters/timestamps
