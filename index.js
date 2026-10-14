@@ -27,6 +27,7 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { GoogleDriveVideoSync } = require('./utils/google-drive-video-sync');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -52,6 +53,8 @@ class YouTubeAutomationAgent {
     this.experiments = null;
     this.discoverability = null;
     this.setupRequired = false;
+    this.driveSync = null;
+    this.driveSyncStatus = { enabled: false, running: false, message: 'Drive sync disabled' };
   }
 
   async initialize() {
@@ -103,6 +106,16 @@ class YouTubeAutomationAgent {
       // Initialize agents
       this.logger.info('Initializing agents...');
       await this.initializeAgents();
+      if (String(process.env.DRIVE_SYNC_ENABLED || 'false').toLowerCase() === 'true') {
+        this.driveSync = new GoogleDriveVideoSync(this.credentials, { logger: this.logger });
+        try {
+          const started = await this.driveSync.initialize();
+          this.driveSyncStatus = { enabled: true, running: started, message: started ? 'Drive sync polling is active' : 'Drive sync did not start' };
+        } catch (driveError) {
+          this.driveSyncStatus = { enabled: true, running: false, message: driveError.message };
+          this.logger.error('Google Drive sync is configured but could not start:', driveError);
+        }
+      }
       this.scenes = this.agents.production?.sceneRepair || new SceneRepairService(
         this.db,
         this.agents.production?.aiVideoGenerator,
@@ -395,6 +408,10 @@ class YouTubeAutomationAgent {
       this.logger.warn('API_KEY is not set; mutating API routes are unprotected');
     }
     
+    this.app.get('/api/drive-sync/status', this.requireAPIKey(), (_req, res) => {
+      res.json({ ...this.driveSyncStatus, folderId: process.env.DRIVE_FOLDER_ID || '1PVOAlPtbJXLsS0L8J-cULdVGXr2B-ih5', pollIntervalSeconds: Number(process.env.DRIVE_POLL_INTERVAL_SECONDS || 300) });
+    });
+
     // Main dashboard route
     this.app.get('/', (req, res) => {
       res.sendFile(path.join(__dirname, 'dashboard', 'index.html'));
