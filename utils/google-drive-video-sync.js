@@ -146,7 +146,7 @@ class GoogleDriveVideoSync {
 
       const seo = await this.generateMetadata(file.name);
       const metadata = assertValidYouTubeMetadata(seo).value;
-      const delayMs = this.publishDelayMinutes * 60 * 1000;
+      const delayMs = this.publishDelayMinutes > 0 ? Math.max(this.publishDelayMinutes, 15) * 60 * 1000 : 0;
       const publishAt = new Date(Date.now() + delayMs).toISOString();
       const videoStatus = { privacyStatus: 'private', selfDeclaredMadeForKids: false };
       if (delayMs >= 15 * 60 * 1000) videoStatus.publishAt = publishAt;
