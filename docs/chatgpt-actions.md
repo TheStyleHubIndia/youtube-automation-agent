@@ -19,5 +19,5 @@ This repository exposes a ChatGPT Actions-compatible OpenAPI schema at:
 
 - The Actions schema endpoint is public, but every operational Action requires the configured API key. If `API_KEY` is unset, those endpoints fail closed with HTTP 503.
 - The generation Action starts a job; it does not bypass the application's approval, provenance, media-rights, or production-readiness checks.
-- A future YouTube publish time is sent as `status.publishAt` only when the video is private and the time is valid and in the future. YouTube documents that `publishAt` is valid only for private videos that have never been published.
+- A valid scheduled publish time is sent as `status.publishAt` with private status. YouTube documents that `publishAt` is valid only for private videos that have never been published; a past publish time causes immediate publication, which handles an overdue queue item.
 - Keep all API keys and OAuth token files on the server. Never put secrets in the OpenAPI schema or a client-side app.
