@@ -12,6 +12,7 @@ class PublishingSchedulingAgent {
     this.logger = new Logger('PublishingScheduling');
     this.youtube = null;
     this.publishQueue = [];
+    this.scheduleLocks = new Map();
   }
 
   async initialize() {
@@ -43,6 +44,21 @@ class PublishingSchedulingAgent {
   }
 
   async scheduleContent(productionData) {
+    const productionId = String(productionData?.id || '').trim();
+    if (!productionId) throw new Error('A production ID is required before scheduling');
+    const inFlight = this.scheduleLocks.get(productionId);
+    if (inFlight) return inFlight;
+
+    const operation = this._scheduleContentOnce(productionData);
+    this.scheduleLocks.set(productionId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.scheduleLocks.get(productionId) === operation) this.scheduleLocks.delete(productionId);
+    }
+  }
+
+  async _scheduleContentOnce(productionData) {
     try {
       const finalVideo = productionData.assets?.finalVideo;
       if (!finalVideo || finalVideo.simulated || path.extname(finalVideo.path || '').toLowerCase() !== '.mp4') {
@@ -205,6 +221,23 @@ class PublishingSchedulingAgent {
     const safeMetadata = validation.value;
     
     // Prepare video metadata
+    const requestedPublishTime = scheduleEntry.publishTime ? new Date(scheduleEntry.publishTime) : null;
+    const hasValidPublishTime = Boolean(
+      requestedPublishTime && Number.isFinite(requestedPublishTime.getTime())
+    );
+    // The queue uploads an item when its requested time is due. YouTube accepts
+    // publishAt only for private videos that have never been published; a past
+    // publishAt means publish immediately, which handles delayed queue processing.
+    const privacyStatus = hasValidPublishTime
+      ? 'private'
+      : (metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private');
+    const videoStatus = {
+      privacyStatus,
+      selfDeclaredMadeForKids: false,
+      containsSyntheticMedia: metadata.containsSyntheticMedia === true
+    };
+    if (hasValidPublishTime) videoStatus.publishAt = requestedPublishTime.toISOString();
+
     const videoMetadata = {
       snippet: {
         title: safeMetadata.title,
@@ -214,12 +247,7 @@ class PublishingSchedulingAgent {
         defaultLanguage: safeMetadata.defaultLanguage,
         defaultAudioLanguage: safeMetadata.defaultAudioLanguage
       },
-      status: {
-        privacyStatus: metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
-        publishAt: scheduleEntry.publishTime,
-        selfDeclaredMadeForKids: false,
-        containsSyntheticMedia: metadata.containsSyntheticMedia === true
-      }
+      status: videoStatus
     };
     
     // Resolve the file before marking the network upload as attempted.

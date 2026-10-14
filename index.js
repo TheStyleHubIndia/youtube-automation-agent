@@ -27,6 +27,7 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { GoogleDriveVideoSync } = require('./utils/google-drive-video-sync');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -52,6 +53,8 @@ class YouTubeAutomationAgent {
     this.experiments = null;
     this.discoverability = null;
     this.setupRequired = false;
+    this.driveSync = null;
+    this.driveSyncStatus = { enabled: false, running: false, message: 'Drive sync disabled' };
   }
 
   async initialize() {
@@ -103,6 +106,16 @@ class YouTubeAutomationAgent {
       // Initialize agents
       this.logger.info('Initializing agents...');
       await this.initializeAgents();
+      if (String(process.env.DRIVE_SYNC_ENABLED || 'false').toLowerCase() === 'true') {
+        this.driveSync = new GoogleDriveVideoSync(this.credentials, { logger: this.logger });
+        try {
+          const started = await this.driveSync.initialize();
+          this.driveSyncStatus = { enabled: true, running: started, message: started ? 'Drive sync polling is active' : 'Drive sync did not start' };
+        } catch (driveError) {
+          this.driveSyncStatus = { enabled: true, running: false, message: driveError.message };
+          this.logger.error('Google Drive sync is configured but could not start:', driveError);
+        }
+      }
       this.scenes = this.agents.production?.sceneRepair || new SceneRepairService(
         this.db,
         this.agents.production?.aiVideoGenerator,
@@ -222,6 +235,21 @@ class YouTubeAutomationAgent {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
+      return next();
+    };
+  }
+
+  requireChatGPTAPIKey() {
+    return (req, res, next) => {
+      if (!process.env.API_KEY) {
+        return res.status(503).json({
+          success: false,
+          error: 'ChatGPT Actions are disabled until API_KEY is configured on the server'
+        });
+      }
+      if (req.get('x-api-key') !== process.env.API_KEY) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
       return next();
     };
   }
@@ -380,6 +408,10 @@ class YouTubeAutomationAgent {
       this.logger.warn('API_KEY is not set; mutating API routes are unprotected');
     }
     
+    this.app.get('/api/drive-sync/status', this.requireAPIKey(), (_req, res) => {
+      res.json({ ...this.driveSyncStatus, folderId: process.env.DRIVE_FOLDER_ID || '1PVOAlPtbJXLsS0L8J-cULdVGXr2B-ih5', pollIntervalSeconds: Number(process.env.DRIVE_POLL_INTERVAL_SECONDS || 300) });
+    });
+
     // Main dashboard route
     this.app.get('/', (req, res) => {
       res.sendFile(path.join(__dirname, 'dashboard', 'index.html'));
@@ -396,6 +428,145 @@ class YouTubeAutomationAgent {
         timestamp: new Date().toISOString()
       });
     });
+
+    // ChatGPT Actions schema is public so the GPT builder can import it.
+    // Mutating/read-data operations in this schema require the configured x-api-key.
+    this.app.get('/api/chatgpt/openapi.json', (req, res) => {
+      const forwardedProto = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
+      const baseUrl = String(process.env.PUBLIC_BASE_URL || `${forwardedProto || req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+      res.json({
+        openapi: '3.1.0',
+        info: {
+          title: 'YouTube Automation Agent',
+          version,
+          description: 'Securely inspect automation status, generate content jobs, and check publishing schedules.'
+        },
+        servers: [{ url: baseUrl }],
+        security: [{ ApiKeyAuth: [] }],
+        paths: {
+          '/api/chatgpt/status': {
+            get: {
+              operationId: 'getAutomationStatus',
+              summary: 'Get YouTube automation readiness',
+              responses: { '200': { description: 'Automation status' }, '401': { description: 'Invalid API key' } }
+            }
+          },
+          '/api/chatgpt/generate': {
+            post: {
+              operationId: 'generateYouTubeContent',
+              summary: 'Start a content-generation job',
+              description: 'Starts a job only. Existing review and publishing safety gates remain enabled.',
+              requestBody: {
+                required: false,
+                content: {
+                  'application/json': {
+                    schema: {
+                      type: 'object',
+                      properties: {
+                        topic: { type: 'string', maxLength: 200, description: 'Optional topic; omitted means automatic topic selection' },
+                        style: { type: 'string', maxLength: 100 },
+                        length: { type: 'string', enum: ['short', 'medium', 'long'] }
+                      },
+                      additionalProperties: false
+                    }
+                  }
+                }
+              },
+              responses: {
+                '202': { description: 'Generation job accepted' },
+                '400': { description: 'Invalid request' },
+                '401': { description: 'Invalid API key' },
+                '503': { description: 'Setup is incomplete' }
+              }
+            }
+          },
+          '/api/chatgpt/jobs/{jobId}': {
+            get: {
+              operationId: 'getYouTubeGenerationJob',
+              summary: 'Get generation job status',
+              parameters: [{ name: 'jobId', in: 'path', required: true, schema: { type: 'string' } }],
+              responses: { '200': { description: 'Job details' }, '404': { description: 'Job not found' } }
+            }
+          },
+          '/api/chatgpt/schedule': {
+            get: {
+              operationId: 'getYouTubePublishingSchedule',
+              summary: 'List upcoming publishing schedule',
+              responses: { '200': { description: 'Upcoming schedule entries' } }
+            }
+          }
+        },
+        components: {
+          securitySchemes: {
+            ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' }
+          }
+        }
+      });
+    });
+
+    this.app.get('/api/chatgpt/status', this.requireChatGPTAPIKey(), async (_req, res) => {
+      res.json({
+        success: true,
+        status: this.setupRequired ? 'setup_required' : 'healthy',
+        initialized: this.isInitialized,
+        setupRequired: this.setupRequired,
+        configured: {
+          youtubePublishing: Boolean(this.agents.publishing),
+          aiText: Boolean(this.agents.seoOptimizer?.aiTextService?.isAvailable?.()),
+          publicBaseUrl: Boolean(process.env.PUBLIC_BASE_URL)
+        },
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    this.app.post('/api/chatgpt/generate', this.requireChatGPTAPIKey(), async (req, res) => {
+      try {
+        if (this.setupRequired) {
+          return res.status(503).json({ success: false, error: 'Finish setup with npm run walkthrough before generating content' });
+        }
+        const validation = this.validateGenerateRequestBody(req.body || {});
+        if (!validation.valid) {
+          return res.status(validation.status).json({ success: false, error: validation.error });
+        }
+        const { topic, style, length } = validation.value;
+        const result = await this.startGenerationJob({ topic, style, length, source: 'chatgpt-actions' });
+        return res.status(202).json({ success: true, result });
+      } catch (error) {
+        return res.status(error.status || 500).json({ success: false, error: error.message });
+      }
+    });
+
+    this.app.get('/api/chatgpt/jobs/:jobId', this.requireChatGPTAPIKey(), async (req, res) => {
+      try {
+        const job = await this.db.getGenerationJob(req.params.jobId);
+        if (!job) return res.status(404).json({ success: false, error: 'Generation job not found' });
+        return res.json({
+          success: true,
+          job: {
+            id: job.id,
+            status: job.status,
+            stage: job.stage,
+            progress: job.progress,
+            title: job.title,
+            error: job.error,
+            createdAt: job.created_at,
+            updatedAt: job.updated_at
+          }
+        });
+      } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    this.app.get('/api/chatgpt/schedule', this.requireChatGPTAPIKey(), async (_req, res) => {
+      try {
+        const schedule = await this.db.getUpcomingSchedule();
+        return res.json({ success: true, schedule: schedule || [] });
+      } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
 
     // Manual content generation
     this.app.post('/generate', this.requireAPIKey(), async (req, res) => {

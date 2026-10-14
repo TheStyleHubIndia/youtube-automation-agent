@@ -48,9 +48,26 @@ class SEOOptimizerAgent {
         tags = await this.generateTags(script, strategy);
       }
       
-      // Generate hashtags
+      // Generate hashtags and include them in the actual YouTube description.
       const hashtags = await this.generateHashtags(strategy);
-      
+      const hashtagLine = (Array.isArray(hashtags) ? hashtags : [])
+        .map(value => String(value || '').trim())
+        .map(value => value.startsWith('#') ? value : `#${value.replace(/^#+/, '')}`)
+        .filter(value => /^#[\p{L}\p{N}_]+$/u.test(value))
+        .filter((value, index, values) => values.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index)
+        .slice(0, 15)
+        .join(' ');
+      if (hashtagLine) {
+        const existingDescription = String(description || '').trim();
+        if (existingDescription.toLowerCase().includes(hashtagLine.toLowerCase())) {
+          description = existingDescription.slice(0, 5000);
+        } else {
+          const descriptionBudget = Math.max(0, 5000 - hashtagLine.length - 2);
+          const clippedDescription = existingDescription.slice(0, descriptionBudget).trimEnd();
+          description = [clippedDescription, hashtagLine].filter(Boolean).join('\n\n').slice(0, 5000);
+        }
+      }
+
       // Create chapters/timestamps
       const chapters = await this.generateChapters(script);
       

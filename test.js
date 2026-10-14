@@ -42,6 +42,10 @@ class SystemTest {
       { name: 'Publishing Safety', test: () => this.testPublishingSafety() },
       { name: 'Multi-Provider Credential Validation', test: () => this.testCredentialValidation() },
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
+      { name: 'AI Provider Failover', test: () => this.testAITextProviderFailover() },
+      { name: 'Google Drive SEO Metadata', test: () => this.testGoogleDriveMetadata() },
+      { name: 'Concurrent Schedule Deduplication', test: () => this.testConcurrentScheduleDeduplication() },
+      { name: 'YouTube Scheduled Publish Metadata', test: () => this.testYouTubePublishAtMetadata() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
@@ -2306,6 +2310,141 @@ class SystemTest {
     }
 
     this.logger.info('AI text service token parameter test completed successfully');
+  }
+
+  async testAITextProviderFailover() {
+    const { AITextService, PROVIDERS } = require('./utils/ai-text-service');
+    const keys = [...Object.values(PROVIDERS).map(provider => provider.envKey), 'GEMINI_API_KEY'];
+    const saved = {};
+    for (const key of keys) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    try {
+      const service = new AITextService({
+        aiProvider: { provider: 'openai', apiKey: 'test-openai-key', model: 'test-openai-model' },
+        gemini: { apiKey: 'test-gemini-key', model: 'test-gemini-model' }
+      });
+      service.client.chat.completions.create = async () => {
+        throw new Error('simulated OpenAI outage');
+      };
+      const fallback = service.fallbackProviders.find(provider => provider.type === 'gemini');
+      if (!fallback) throw new Error('Configured Gemini provider was not registered as fallback');
+      fallback.client.models.generateContent = async () => ({ text: 'gemini-fallback-ok' });
+
+      const result = await service.generateText('fallback test');
+      if (result !== 'gemini-fallback-ok') throw new Error('Gemini fallback did not recover text generation');
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
+  }
+
+  async testGoogleDriveMetadata() {
+    const { GoogleDriveVideoSync } = require('./utils/google-drive-video-sync');
+    const service = new GoogleDriveVideoSync({ credentials: {} });
+    service.ai = {
+      generateText: async () => JSON.stringify({
+        title: 'Beginner Cooking Tips',
+        description: 'Simple cooking tips for beginners.',
+        hashtags: ['CookingTips', '#BeginnerCooking', 'Food'],
+        tags: ['cooking', 'beginner cooking', 'kitchen tips'],
+        categoryId: '26',
+        defaultLanguage: 'en'
+      })
+    };
+    const metadata = await service.generateMetadata('beginner_cooking_tips.mp4');
+    if (metadata.title !== 'Beginner Cooking Tips') throw new Error('Drive metadata title was not parsed');
+    if (!metadata.description.includes('#CookingTips') || !metadata.description.includes('#BeginnerCooking')) {
+      throw new Error('Drive metadata hashtags were not included in the description');
+    }
+    if (metadata.tags.length < 3 || metadata.categoryId !== '26') {
+      throw new Error('Drive metadata tags/category were not preserved');
+    }
+  }
+
+  async testConcurrentScheduleDeduplication() {
+    const { Database } = require('./database/db');
+    const database = Object.create(Database.prototype);
+    database.scheduleSaveChain = Promise.resolve();
+    const rows = [];
+    let nextId = 0;
+    database.generateId = () => `schedule-test-${++nextId}`;
+    database.getLatestScheduleEntry = async productionId =>
+      rows.find(row => row.production_id === productionId) || null;
+    database.executeQuery = async (_sql, params) => {
+      rows.push({
+        id: params[0],
+        production_id: params[1],
+        title: params[2],
+        publish_time: params[3],
+        status: params[4],
+        priority: params[5],
+        metadata: params[6]
+      });
+    };
+
+    const attempts = Array.from({ length: 12 }, (_, index) => database.saveScheduleEntry({
+      productionId: 'same-production',
+      title: `Title ${index}`,
+      publishTime: new Date(Date.now() + 60_000).toISOString(),
+      status: 'scheduled',
+      priority: 50,
+      metadata: {}
+    }));
+    const saved = await Promise.all(attempts);
+    if (rows.length !== 1) throw new Error(`Expected one schedule row, got ${rows.length}`);
+    if (new Set(saved.map(entry => entry.id)).size !== 1) {
+      throw new Error('Concurrent schedule requests returned different schedule IDs');
+    }
+  }
+
+  async testYouTubePublishAtMetadata() {
+    const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
+    const agent = new PublishingSchedulingAgent({
+      updateScheduleEntry: async () => {}
+    }, {});
+    let requestBody = null;
+    agent.youtube = {
+      videos: {
+        insert: async request => {
+          requestBody = request.requestBody;
+          return { data: { id: 'test-youtube-id' } };
+        }
+      }
+    };
+    agent.getVideoStream = async () => ({});
+
+    const baseEntry = {
+      productionId: 'publish-at-test',
+      metadata: {
+        seo: {
+          title: 'Valid test title',
+          description: 'A sufficiently detailed description for validating YouTube scheduled publishing metadata.',
+          tags: ['test tag one', 'test tag two', 'test tag three'],
+          categoryId: '22',
+          defaultLanguage: 'en',
+          defaultAudioLanguage: 'en'
+        },
+        video: { path: 'test.mp4' },
+        privacyStatus: 'private'
+      }
+    };
+
+    const futureTime = new Date(Date.now() + 10 * 60_000).toISOString();
+    await agent.uploadToYouTube({ ...baseEntry, publishTime: futureTime, metadata: { ...baseEntry.metadata, seo: { ...baseEntry.metadata.seo }, video: { ...baseEntry.metadata.video } } });
+    if (requestBody.status.privacyStatus !== 'private' || requestBody.status.publishAt !== futureTime) {
+      throw new Error('A future scheduled upload must use private status and publishAt');
+    }
+
+    const pastTime = new Date(Date.now() - 10 * 60_000).toISOString();
+    await agent.uploadToYouTube({ ...baseEntry, publishTime: pastTime, metadata: { ...baseEntry.metadata, seo: { ...baseEntry.metadata.seo }, video: { ...baseEntry.metadata.video } } });
+    if (requestBody.status.privacyStatus !== 'private' || requestBody.status.publishAt !== pastTime) {
+      throw new Error('An overdue scheduled upload must retain publishAt so YouTube publishes it immediately');
+    }
   }
 
   async testPlaceholderSchedulingGuard() {
