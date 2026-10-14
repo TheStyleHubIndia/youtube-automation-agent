@@ -649,6 +649,36 @@ class Database {
       error_code: 'TEXT'
     });
 
+    // Retire older duplicate queue rows without deleting history, then let SQLite
+    // enforce one active schedule per production even if two processes race.
+    await this.executeQuery(`
+      UPDATE publish_schedule
+      SET status = 'duplicate_superseded',
+          error_message = COALESCE(error_message, 'Superseded duplicate active schedule during deduplication')
+      WHERE status IN ('scheduled', 'paused', 'uploading')
+        AND youtube_id IS NULL
+        AND EXISTS (
+          SELECT 1 FROM publish_schedule newer
+          WHERE newer.production_id = publish_schedule.production_id
+            AND newer.status IN ('scheduled', 'paused', 'uploading')
+            AND (
+              newer.created_at > publish_schedule.created_at OR
+              (newer.created_at = publish_schedule.created_at AND newer.id > publish_schedule.id)
+            )
+        )
+    `);
+    try {
+      await this.executeQuery(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_schedule_one_active_per_production
+        ON publish_schedule(production_id)
+        WHERE status IN ('scheduled', 'paused', 'uploading')
+      `);
+    } catch (error) {
+      // Preserve startup for legacy databases containing an uploaded/uncertain duplicate
+      // that cannot safely be auto-retired; log it for operator reconciliation.
+      this.logger.warn(`Could not enable active schedule uniqueness index: ${error.message}`);
+    }
+
     // Insert default settings
     await this.insertDefaultSettings();
   }
@@ -1774,21 +1804,29 @@ class Database {
       const id = this.generateId('schedule');
       const record = { ...entry, id };
 
-      await this.executeQuery(
-        `INSERT INTO publish_schedule (
-          id, production_id, title, publish_time, status,
-          priority, metadata
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          id,
-          record.productionId,
-          record.title,
-          record.publishTime,
-          record.status,
-          record.priority,
-          JSON.stringify(record.metadata)
-        ]
-      );
+      try {
+        await this.executeQuery(
+          `INSERT INTO publish_schedule (
+            id, production_id, title, publish_time, status,
+            priority, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            id,
+            record.productionId,
+            record.title,
+            record.publishTime,
+            record.status,
+            record.priority,
+            JSON.stringify(record.metadata)
+          ]
+        );
+      } catch (error) {
+        if (/UNIQUE constraint failed: publish_schedule\.production_id/i.test(error.message || '')) {
+          const raced = await this.getLatestScheduleEntry(entry.productionId);
+          if (raced) return raced;
+        }
+        throw error;
+      }
 
       Object.assign(entry, record);
       return entry;
