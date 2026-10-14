@@ -127,7 +127,7 @@ class AITextService {
 
     if (provider.type === 'gemini') {
       const config = { maxOutputTokens: maxTokens };
-      if (!/^gemini-3\\.(?:[5-9]|\\d{2,})-/.test(model)) config.temperature = temperature;
+      if (!/^gemini-3\.(?:[5-9]|\d{2,})-/.test(model)) config.temperature = temperature;
       const response = await provider.client.models.generateContent({ model, contents: prompt, config });
       const text = response && response.text;
       if (typeof text !== 'string' || !text.trim()) {
