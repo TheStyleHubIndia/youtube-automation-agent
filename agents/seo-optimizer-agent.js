@@ -53,7 +53,7 @@ class SEOOptimizerAgent {
       const hashtagLine = (Array.isArray(hashtags) ? hashtags : [])
         .map(value => String(value || '').trim())
         .map(value => value.startsWith('#') ? value : `#${value.replace(/^#+/, '')}`)
-        .filter(value => /^#[\\p{L}\\p{N}_]+$/u.test(value))
+        .filter(value => /^#[\p{L}\p{N}_]+$/u.test(value))
         .filter((value, index, values) => values.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index)
         .slice(0, 15)
         .join(' ');
@@ -61,7 +61,7 @@ class SEOOptimizerAgent {
         const existingDescription = String(description || '').trim();
         const descriptionWithHashtags = existingDescription.toLowerCase().includes(hashtagLine.toLowerCase())
           ? existingDescription
-          : [existingDescription, hashtagLine].filter(Boolean).join('\\n\\n');
+          : [existingDescription, hashtagLine].filter(Boolean).join('\n\n');
         description = descriptionWithHashtags.slice(0, 5000);
       }
 
