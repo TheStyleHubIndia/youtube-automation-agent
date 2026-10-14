@@ -43,6 +43,7 @@ class SystemTest {
       { name: 'Multi-Provider Credential Validation', test: () => this.testCredentialValidation() },
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
       { name: 'AI Provider Failover', test: () => this.testAITextProviderFailover() },
+      { name: 'Google Drive SEO Metadata', test: () => this.testGoogleDriveMetadata() },
       { name: 'Concurrent Schedule Deduplication', test: () => this.testConcurrentScheduleDeduplication() },
       { name: 'YouTube Scheduled Publish Metadata', test: () => this.testYouTubePublishAtMetadata() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
@@ -2339,6 +2340,29 @@ class SystemTest {
         if (saved[key] === undefined) delete process.env[key];
         else process.env[key] = saved[key];
       }
+    }
+  }
+
+  async testGoogleDriveMetadata() {
+    const { GoogleDriveVideoSync } = require('./utils/google-drive-video-sync');
+    const service = new GoogleDriveVideoSync({ credentials: {} });
+    service.ai = {
+      generateText: async () => JSON.stringify({
+        title: 'Beginner Cooking Tips',
+        description: 'Simple cooking tips for beginners.',
+        hashtags: ['CookingTips', '#BeginnerCooking', 'Food'],
+        tags: ['cooking', 'beginner cooking', 'kitchen tips'],
+        categoryId: '26',
+        defaultLanguage: 'en'
+      })
+    };
+    const metadata = await service.generateMetadata('beginner_cooking_tips.mp4');
+    if (metadata.title !== 'Beginner Cooking Tips') throw new Error('Drive metadata title was not parsed');
+    if (!metadata.description.includes('#CookingTips') || !metadata.description.includes('#BeginnerCooking')) {
+      throw new Error('Drive metadata hashtags were not included in the description');
+    }
+    if (metadata.tags.length < 3 || metadata.categoryId !== '26') {
+      throw new Error('Drive metadata tags/category were not preserved');
     }
   }
 
